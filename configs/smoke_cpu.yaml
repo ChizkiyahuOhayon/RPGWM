@@ -1,0 +1,41 @@
+# CPU smoke run: full stage-B loop (data -> rollout -> splat -> loss -> eval ->
+# report) on synthetic data in under a minute. Run before every server push:
+#   .venv/bin/python scripts/train.py --config configs/smoke_cpu.yaml --max-steps 3
+run_name: smoke_cpu
+seed: 0
+
+data:
+  synthetic: true
+  synthetic_kwargs:
+    num_items: 4
+    n_gaussians: 48
+    num_classes: 17
+    feat_dim: 32
+    resolution: [16, 16, 8]
+    extent: 8.0
+    future_frames: 3
+
+model:
+  num_classes: 17
+  feat_dim: 32
+  rollout:
+    dim: 64
+    layers: 2
+    heads: 4
+    knn: 8
+    steps: 3
+
+grid:
+  xyz_min: [-8.0, -8.0, -4.0]
+  xyz_max: [8.0, 8.0, 4.0]
+  resolution: [16, 16, 8]
+  tau: 0.5
+
+train:
+  micro_batch_per_gpu: 2
+  grad_accum: 1
+  lr: 1.0e-3
+  epochs: 1
+  num_workers: 0
+  log_every: 1
+  eval_batches: 2

@@ -19,8 +19,17 @@ rpgwm/models/reliability.py   M2: realized error e_i, quantile normalizer, ρ he
 rpgwm/losses.py               recon + ρ regression + plan-sufficiency (Eq. 5/6)
 rpgwm/eval/forecast.py        Occ3D masked IoU/mIoU forecasting protocol (must be
                               cross-checked vs official OccWorld eval before use)
+rpgwm/data/nuscenes_occ.py    sequence dataset (cached Gaussian states + Occ3D labels);
+                              SyntheticSequenceDataset mirrors the contract for CPU tests
+scripts/build_index.py        one-off (server): devkit -> plain JSON scene index
+scripts/dump_gaussians.py     one-off (server): encoder inference -> per-token state cache
+                              (--encoder random for plumbing tests; gf2 hook = RUNBOOK step 2)
+scripts/train.py              stage-B trainer (DDP-ready, bf16, grad-accum, report.json,
+                              Gate-1 eval vs copy-last-frame through the same splat path)
+scripts/crosscheck_eval.py    our protocol vs official OccWorld eval on identical dumps
 tests/                        CPU unit tests — ALL must pass before anything ships to GPU
 configs/gate1_mini.yaml       Gate-1 experiment spec
+configs/smoke_cpu.yaml        <1 min full-loop CPU smoke (run before every push)
 ```
 
 ## Dev loop (remote-GPU discipline)
