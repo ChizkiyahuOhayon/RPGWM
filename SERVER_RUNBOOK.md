@@ -58,10 +58,25 @@ CUDA_VISIBLE_DEVICES=1 python scripts/crosscheck_eval.py \
 ## 4. Gate-1 mini 训练（W2-W4，≈2-4 GPU-days）
 
 ```bash
-# 阶段 A'（mini）：编码器热启 GF-2 权重，短程适配 N=6400 + 流式搬运
+pip install nuscenes-devkit pyquaternion   # 仅本步需要
+
+# 4a. 建索引（devkit 只在这一步用到）
+python scripts/build_index.py --nuscenes-root data/nuscenes --version v1.0-mini \
+    --split train --out data/index_mini_train.json
+python scripts/build_index.py --nuscenes-root data/nuscenes --version v1.0-mini \
+    --split val --out data/index_mini_val.json
+
+# 4b. 先用 random 编码器打通全管线（不出数字，只验证 I/O 与吞吐）
+python scripts/dump_gaussians.py --index data/index_mini_train.json \
+    --out data/gaussian_cache --encoder random --n 6400
+CUDA_VISIBLE_DEVICES=0 python scripts/train.py --config configs/gate1_mini.yaml --max-steps 20
+
+# 4c. 接入 GF-2 编码器（填 scripts/dump_gaussians.py 里的 build_gf2_encoder TODO，
+#     用步骤 2 验收过的 ckpt），重新 dump 缓存，然后正式训练：
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train.py \
     --config configs/gate1_mini.yaml
 ```
+产物 `outputs/gate1_mini/report.json` 内含 `gate1_beats_copy_last_frame` 布尔位。
 - Gate-1 验收：nuScenes-mini 上 6 步 rollout 的 forecast 显著优于 copy-last-frame 基线；
   失败 → 一周排障（先查 splatting 数值、再查动作条件化），再失败 → 启动 Plan B（见计划 §7）。
 
