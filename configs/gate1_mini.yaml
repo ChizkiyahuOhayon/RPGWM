@@ -1,0 +1,49 @@
+# Gate-1: nuScenes-mini, 6-step Gaussian rollout must beat copy-last-frame.
+run_name: gate1_mini
+seed: 0
+
+data:
+  nuscenes_root: data/nuscenes        # v1.0-mini first
+  occ3d_root: data/occ3d
+  version: v1.0-mini
+  history_frames: 4                   # 2 s @ 2 Hz
+  future_frames: 6                    # 3 s @ 2 Hz
+
+model:
+  num_gaussians: 6400
+  num_classes: 17
+  feat_dim: 256
+  encoder:
+    backbone: resnet50
+    image_size: [256, 704]
+    init_from: ckpts/gaussianformer2.pth   # warm start (SERVER_RUNBOOK step 2)
+    freeze: true                            # stage B: frozen encoder
+  rollout:
+    dim: 256
+    layers: 4
+    heads: 4
+    knn: 32
+    steps: 6
+
+grid:
+  xyz_min: [-40.0, -40.0, -1.0]
+  xyz_max: [40.0, 40.0, 5.4]
+  resolution: [200, 200, 16]
+  tau: 0.5
+
+train:
+  devices: 2
+  precision: bf16
+  micro_batch_per_gpu: 1
+  grad_accum: 4                       # effective batch 8
+  lr: 2.0e-4
+  weight_decay: 0.01
+  epochs: 24
+  grad_checkpointing: true
+  cache_backbone_features: true
+
+eval:
+  protocol: occworld                  # cross-checked per SERVER_RUNBOOK step 3
+  horizons_s: [1.0, 2.0, 3.0]
+  use_camera_mask: true
+  baseline: copy_last_frame           # Gate-1 comparator
