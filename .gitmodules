@@ -1,0 +1,18 @@
+[submodule "third_party/GaussianFormer"]
+	path = third_party/GaussianFormer
+	url = https://github.com/huang-yh/GaussianFormer
+[submodule "third_party/GaussianWorld"]
+	path = third_party/GaussianWorld
+	url = https://github.com/zuosc19/GaussianWorld
+[submodule "third_party/DiffusionDrive"]
+	path = third_party/DiffusionDrive
+	url = https://github.com/hustvl/DiffusionDrive
+[submodule "third_party/navsim"]
+	path = third_party/navsim
+	url = https://github.com/autonomousvision/navsim
+[submodule "third_party/Vista"]
+	path = third_party/Vista
+	url = https://github.com/OpenDriveLab/Vista
+[submodule "third_party/SparseVLMs"]
+	path = third_party/SparseVLMs
+	url = https://github.com/Gumpest/SparseVLMs

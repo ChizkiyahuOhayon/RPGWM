@@ -4,5 +4,5 @@ __pycache__/
 outputs/
 /data/
 ckpts/
-third_party/
 .pytest_cache/
+third_party/GEM/
