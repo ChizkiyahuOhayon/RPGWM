@@ -1,53 +1,115 @@
-"""Partial warm-start of GaussianEncoder from the official GaussianFormer-2
-checkpoint (Prob-64, config/prob/nuscenes_gs6400.py — R101-DCN @ 1600x864,
-SurroundOcc supervision).
+"""OPPORTUNISTIC (lottery-ticket) partial warm-start of GaussianEncoder from
+the official GaussianFormer-2 checkpoint. Decision 2026-07-16: warm-start is
+no longer a foundation of stage A — the acceptance test is an A/B on a
+1/4-split (GF-2 blocks warm vs random init, 1-2 epochs each); whichever wins
+is used. This loader exists because trying is free, not because it is owed
+anything.
 
-What transfers (decision B1(a), plan §2.0):
-  lifter.anchor / lifter.instance_feature -> first 4000 slots (xyz converted
-      from the checkpoint's pc_range into ours; remaining slots keep the grid
-      prior),
-  encoder.anchor_encoder.*                -> anchor_embed.*,
-  per decoder block d (their flat `encoder.layers.{i}` under the operation
-  order [identity, deformable, add, norm, identity, ffn, add, norm, identity,
-  spconv, add, norm, identity, ffn, add, norm, refine] x num_decoder):
+Why it is a lottery, with evidence (discipline: paper + config, conflicts
+recorded, config wins):
+  - every released nuScenes checkpoint is R101-DCN + FCOS3D @ final_dim
+    1600x864 (config/prob/nuscenes_gs6400.py:8,92,102; nuscenes_gs144000.py:
+    8,74,83; paper 2412.04384 §4.2 says R101-DCN, raw 900x1600 — the 864 crop
+    comes from the data_aug pipeline, conflict recorded); we are R50 @ 256x704
+    (decision B1(a); note config/_base_/surroundocc.py:5 does default to
+    (704, 256), but no released checkpoint was trained at it),
+  - the transferred blocks were trained on stride-4/8/16/32 SECONDFPN features
+    of that backbone; ours are stride-8/16/32/64 R50-FPN (our design choice,
+    not a mismatch claim) — shapes match, semantics may not. Only the A/B can
+    tell.
+
+WHAT TRANSFERS (the ONLY coverage denominator):
+  encoder.anchor_encoder.*        -> anchor_embed.*
+  per decoder block d, under the flat `encoder.layers.{i}` of operation order
+  [identity, deformable, add, norm, identity, ffn, add, norm, identity,
+  spconv, add, norm, identity, ffn, add, norm, refine] x num_decoder:
       layers.{17d+1}  DeformableFeatureAggregation -> blocks.{d}.deformable
-      layers.{17d+3}  LN                           -> blocks.{d}.norm1
-      layers.{17d+5}  AsymmetricFFN                -> blocks.{d}.ffn1
-      layers.{17d+7}  LN                           -> blocks.{d}.norm2
+      layers.{17d+3/7/11/15} LN                    -> blocks.{d}.norm1/2/3/4
+      layers.{17d+5/13} AsymmetricFFN              -> blocks.{d}.ffn1/2
       layers.{17d+9}  SparseConv3D                 -> blocks.{d}.self_interact
-                      when the encoder was built with self_interact='spconv'
-                      (server path, 100% op coverage); skipped for the kNN
-                      fallback (zero-init output => identity at t=0 — sound
-                      because the op is residual: operation order
-                      identity->spconv->add->norm)
-      layers.{17d+11} LN                           -> blocks.{d}.norm3
-      layers.{17d+13} AsymmetricFFN                -> blocks.{d}.ffn2
-      layers.{17d+15} LN                           -> blocks.{d}.norm4
+                                                      (spconv build only)
       layers.{17d+16} RefinementModuleV2           -> blocks.{d}.refine
-What never transfers: img_backbone/img_neck (R101-DCN vs our R50-FPN — the
-weak-start cost accepted in B1(a)), the lifter initializer CNN, spconv ops.
 
-The loader is strict about shapes: a key that exists on both sides with a
-different shape is an ERROR (config drift), not a silent skip.
+NOT_TRANSFERRED manifest (explicit, with reasons) is below; total-coverage
+numbers over anything else are banned — they were used once to claim a "100%"
+that only proved the mapper agrees with itself.
 """
 from __future__ import annotations
 
 import torch
 
-from .encoder import GaussianEncoder, safe_inverse_sigmoid, safe_sigmoid
+from .encoder import GaussianEncoder
 
-GF2_PC_RANGE = (-50.0, -50.0, -5.0, 50.0, 50.0, 3.0)   # SurroundOcc range
 OPS_PER_DECODER = 17
 BLOCK_OFFSETS = {  # op index within a decoder -> our submodule name
     1: "deformable", 3: "norm1", 5: "ffn1", 7: "norm2",
     11: "norm3", 13: "ffn2", 15: "norm4", 16: "refine",
 }
-SKIP_PREFIXES = ("img_backbone.", "img_neck.", "head.", "lifter.initializer",
-                 "future_decoder.")
+
+#: Explicitly not transferred — name: reason (with source evidence).
+NOT_TRANSFERRED = {
+    "img_backbone": "R101-DCN@1600x864 (prob/nuscenes_gs6400.py:8,92,102) vs "
+                    "our R50@256x704 (decision B1(a)); backbone starts from "
+                    "ImageNet/nuImages instead",
+    "img_neck": "SECONDFPN over strides 4/8/16/32 vs our FPN 8/16/32/64 — "
+                "our design choice, incompatible by construction",
+    "lifter": "NO static xyz anchor bank exists: lifter.anchor holds only "
+              "scale/rot/opacity/sem (gaussian_lifter_v2.py:56-73); xyz is "
+              "sampled per frame from the image-conditioned depth "
+              "distribution (:169-209, :306-307). lifter.random_anchors "
+              "[2400,28] is static+trainable but transferring 2400/6400 "
+              "slots is the heterogeneous init we rejected (decision 3c). "
+              "lifter.instance_feature is frozen zeros (:80-83) — nothing "
+              "to transfer",
+    "lifter.initializer": "the distribution-based init module (its own "
+                          "R101+SECONDFPN, prob/nuscenes_gs6400.py:127-146) — "
+                          "we do not carry it; PixelDistributionLoss "
+                          "supervises it and is therefore N/A for us",
+    "head": "no transferable weights: GaussianHead's only parameter is "
+            "empty_scalar (gaussian_head.py:43), disabled by "
+            "with_empty=False (prob/nuscenes_gs6400.py:241 analog)",
+    "spconv (knn build)": "when the encoder uses the kNN fallback, "
+                          "layers.{17d+9} is skipped; zero-init output in a "
+                          "residual slot (config op order identity->spconv->"
+                          "add->norm, prob/nuscenes_gs6400.py:219-222) keeps "
+                          "warm-started blocks undisturbed at t=0",
+}
+
+# -- semantic class alignment (evidence-chain based, not palette-based) ------
+# GF-2/SurroundOcc label space, from the LABEL PIPELINE: dense grid init to 17
+# (free), occupied voxels take SurroundOcc ids (transform_3d.py:502-507);
+# class 0 is masked out of supervision (occ_cam_mask = label != 0, :509);
+# eval averages ids 1..16 with these names, empty=17 (eval.py:125-132).
+GF2_CLASS_NAMES = (
+    "others", "barrier", "bicycle", "bus", "car", "construction_vehicle",
+    "motorcycle", "pedestrian", "traffic_cone", "trailer", "truck",
+    "driveable_surface", "other_flat", "sidewalk", "terrain", "manmade",
+    "vegetation")          # ids 0..16; 17 = empty
+# Occ3D-nuScenes label space (Occ3D README / annotations.json category list;
+# re-assert against annotations.json on the server — RUNBOOK step 1).
+OCC3D_CLASS_NAMES = (
+    "others", "barrier", "bicycle", "bus", "car", "construction_vehicle",
+    "motorcycle", "pedestrian", "traffic_cone", "trailer", "truck",
+    "driveable_surface", "other_flat", "sidewalk", "terrain", "manmade",
+    "vegetation")          # ids 0..16; 17 = free
+
+
+def assert_semantic_alignment(src=GF2_CLASS_NAMES, dst=OCC3D_CLASS_NAMES):
+    """Name-keyed identity check. If either side's list ever changes, this
+    goes red instead of silently mis-permuting semantic logits. Note: src
+    id 0 is masked during GF-2 training (transform_3d.py:509) — the
+    transferred class-0 column is effectively untrained; recorded, accepted."""
+    if len(src) != len(dst):
+        raise RuntimeError(f"semantic class count drift: {len(src)} vs {len(dst)}")
+    mism = [(i, s, d) for i, (s, d) in enumerate(zip(src, dst)) if s != d]
+    if mism:
+        raise RuntimeError(
+            "semantic class order differs — a name-keyed permutation of the "
+            f"sem rows/cols is REQUIRED before transfer: {mism}")
 
 
 def build_key_map(encoder: GaussianEncoder) -> dict[str, str]:
-    """checkpoint key -> our key, for every transferable parameter."""
+    """checkpoint key -> our key, Gaussian-encoder blocks ONLY."""
     key_map: dict[str, str] = {}
     ours = dict(encoder.state_dict())
 
@@ -66,47 +128,13 @@ def build_key_map(encoder: GaussianEncoder) -> dict[str, str]:
     return key_map
 
 
-def convert_lifter_anchor(ck_anchor: torch.Tensor, encoder: GaussianEncoder,
-                          src_pc_range=GF2_PC_RANGE):
-    """Re-express checkpoint anchors (normalized in src_pc_range) in our
-    pc_range. Slots landing outside our (smaller) range are clamped by the
-    safe inverse sigmoid — they re-localize within the first refinements.
-    Returns (converted anchors, in-our-range mask before clamping)."""
-    lo_s = ck_anchor.new_tensor(src_pc_range[:3])
-    hi_s = ck_anchor.new_tensor(src_pc_range[3:])
-    xyz_m = safe_sigmoid(ck_anchor[..., :3]) * (hi_s - lo_s) + lo_s
-    lo_d = ck_anchor.new_tensor(encoder.codec.pc_range[:3])
-    hi_d = ck_anchor.new_tensor(encoder.codec.pc_range[3:])
-    unit = (xyz_m - lo_d) / (hi_d - lo_d)
-    in_range = ((unit > 0.0) & (unit < 1.0)).all(-1)
-    return torch.cat([safe_inverse_sigmoid(unit), ck_anchor[..., 3:]], dim=-1), in_range
-
-
-def resample_fill(converted: torch.Tensor, n_fill: int, encoder: GaussianEncoder,
-                  jitter_m: float = 0.5, seed: int = 0) -> torch.Tensor:
-    """Fill the remaining slots by resampling the GF-2 anchor EMPIRICAL
-    distribution (with a small metric xyz jitter) instead of mixing in a 37.5%
-    heterogeneous cold-start population (decision 2026-07-16, item 3c)."""
-    g = torch.Generator().manual_seed(seed)
-    idx = torch.randint(converted.shape[0], (n_fill,), generator=g)
-    fill = converted[idx].clone()
-    lo = fill.new_tensor(encoder.codec.pc_range[:3])
-    hi = fill.new_tensor(encoder.codec.pc_range[3:])
-    xyz_m = safe_sigmoid(fill[:, :3]) * (hi - lo) + lo
-    xyz_m = xyz_m + torch.randn(n_fill, 3, generator=g) * jitter_m
-    fill[:, :3] = safe_inverse_sigmoid((xyz_m - lo) / (hi - lo))
-    return fill
-
-
 def load_gf2_partial(encoder: GaussianEncoder, ck_state: dict,
-                     src_pc_range=GF2_PC_RANGE, min_coverage: float = 0.9,
-                     verbose: bool = True) -> dict:
-    """Copy every transferable tensor; returns a coverage report.
-
-    min_coverage: fraction of OUR transferable keys that must actually be
-    found in the checkpoint — below it we raise (wrong checkpoint / drift)
-    instead of training silently from near-scratch.
-    """
+                     min_coverage: float = 0.9, verbose: bool = True) -> dict:
+    """Copy the transferable block tensors; returns a coverage report whose
+    denominator is EXACTLY the block keys above. Shape mismatch on a mapped
+    key is an error (config drift), not a skip. min_coverage guards against
+    a wrong checkpoint silently degrading to near-random init."""
+    assert_semantic_alignment()
     ck_state = ck_state.get("state_dict", ck_state)
     key_map = build_key_map(encoder)
     ours = encoder.state_dict()
@@ -124,54 +152,23 @@ def load_gf2_partial(encoder: GaussianEncoder, ck_state: dict,
         new_state[our_key] = src.to(dst.dtype)
         loaded.append(our_key)
 
-    # -- lifter anchors: warm slots + empirical resample for the rest -------
-    anchor_slots, kept_frac, fill_n = 0, None, 0
-    if "lifter.anchor" in ck_state:
-        ck_anchor = ck_state["lifter.anchor"]
-        if ck_anchor.shape[-1] != encoder.codec.dim:
-            mismatched.append(("lifter.anchor", tuple(ck_anchor.shape),
-                               (encoder.num_slots, encoder.codec.dim)))
-        else:
-            anchor_slots = min(ck_anchor.shape[0], encoder.num_slots)
-            converted, in_range = convert_lifter_anchor(ck_anchor[:anchor_slots],
-                                                        encoder, src_pc_range)
-            kept_frac = round(float(in_range.float().mean()), 4)
-            bank = ours["anchor"].clone()
-            bank[:anchor_slots] = converted
-            fill_n = encoder.num_slots - anchor_slots
-            if fill_n > 0:
-                bank[anchor_slots:] = resample_fill(converted, fill_n, encoder)
-            new_state["anchor"] = bank
-            loaded.append("anchor")
-    if "lifter.instance_feature" in ck_state:
-        ck_feat = ck_state["lifter.instance_feature"]
-        if ck_feat.shape[-1] == ours["instance_feature"].shape[-1]:
-            feat = ours["instance_feature"].clone()
-            n = min(ck_feat.shape[0], feat.shape[0])
-            feat[:n] = ck_feat[:n]
-            new_state["instance_feature"] = feat
-            loaded.append("instance_feature")
-
-    unexpected = [k for k in ck_state
-                  if k not in key_map and not k.startswith(SKIP_PREFIXES)
-                  and not k.startswith(("lifter.",))]
-
     if mismatched:
         lines = "\n".join(f"  {k}: ckpt{s} vs ours{d}" for k, s, d in mismatched)
         raise RuntimeError(f"GF2 warm-start shape mismatches (config drift?):\n{lines}")
 
-    coverage = len(loaded) / max(len(key_map) + 2, 1)  # +2: anchor & inst feat
+    coverage = len(loaded) / max(len(key_map), 1)
     report = {
-        "loaded": len(loaded), "transferable": len(key_map) + 2,
-        "coverage": round(coverage, 4), "anchor_slots_warmstarted": anchor_slots,
-        "anchor_kept_in_range_frac": kept_frac,   # pre-clamp, decision 3(a)
-        "anchor_slots_resampled": fill_n,          # empirical fill, decision 3(c)
+        "loaded": len(loaded), "transferable_block_keys": len(key_map),
+        "block_coverage": round(coverage, 4),
         "missing_in_ckpt": len(missing),
-        "unexpected_ckpt_keys_sample": sorted(unexpected)[:10],
+        "not_transferred": sorted(NOT_TRANSFERRED),
+        "note": "block_coverage counts Gaussian-encoder blocks ONLY; "
+                "backbone/FPN/lifter are on the NOT_TRANSFERRED manifest. "
+                "Acceptance is the stage-A 1/4-split A/B, not this number.",
     }
     if coverage < min_coverage:
         raise RuntimeError(
-            f"GF2 warm-start coverage {coverage:.1%} < required {min_coverage:.0%}; "
+            f"GF2 block coverage {coverage:.1%} < required {min_coverage:.0%}; "
             f"missing e.g. {missing[:5]} — wrong checkpoint or naming drift.")
 
     encoder.load_state_dict(new_state, strict=False)

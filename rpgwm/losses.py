@@ -31,18 +31,64 @@ def lovasz_binary(prob: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     return torch.dot(errors_sorted, _lovasz_grad(gt[order]))
 
 
-def lovasz_softmax(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def lovasz_softmax(probs: torch.Tensor, labels: torch.Tensor,
+                   ignore: int | None = None) -> torch.Tensor:
     """Multi-class Lovász-Softmax over classes PRESENT in the batch.
-    probs: [P, C] softmax probabilities (masked); labels: [P] long."""
+    probs: [P, C] softmax probabilities (masked); labels: [P] long.
+    ignore: class id excluded from the class loop (GF-2: lovasz_ignore=17,
+    the free class — its voxels still participate as background)."""
     if probs.numel() == 0:
         return probs.new_zeros(())
     losses = []
     for c in labels.unique():
+        if ignore is not None and int(c) == ignore:
+            continue
         fg = (labels == c).float()
         errors = (fg - probs[:, c]).abs()
         errors_sorted, order = torch.sort(errors, descending=True)
         losses.append(torch.dot(errors_sorted, _lovasz_grad(fg[order])))
+    if not losses:
+        return probs.new_zeros(())
     return torch.stack(losses).mean()
+
+
+def official_occupancy_loss(occ_prob: torch.Tensor, sem_logit: torch.Tensor,
+                            gt_label: torch.Tensor, visible: torch.Tensor,
+                            class_weights: torch.Tensor | None = None,
+                            ce_weight: float = 10.0, lovasz_weight: float = 1.0,
+                            free_class: int = 17) -> torch.Tensor:
+    """Stage-A loss = the GF-2 nuScenes recipe, verbatim where portable
+    (encoder stage is no-innovation by discipline, 2026-07-16):
+      weighted (C+1)-way voxel CE x10 + Lovász x1 with the free class
+      excluded from the Lovász class loop, camera-visible voxels only
+      (config/prob/nuscenes_gs6400.py:40-58: num_classes=18, empty_label=17,
+      loss_voxel_ce_weight=10.0, loss_voxel_lovasz_weight=1.0,
+      lovasz_ignore=17, manual_class_weight[18]).
+    NOT ported: PixelDistributionLoss — it supervises the lifter's
+    per-pixel depth-distribution initializer (pixel_logits/pixel_gt produced
+    in gaussian_lifter_v2.py:169,200-201,320-321), a module we do not carry;
+    it has no input in our architecture. Recorded, not substituted.
+
+    The (C+1)-way distribution is assembled from the splat outputs:
+      p(c) = occ_prob * softmax(sem)[c],  p(free) = 1 - occ_prob.
+    class_weights: [C+1] tensor (last = free); None -> uniform. GF-2's
+    manual_class_weight is fitted to SurroundOcc frequencies — recompute on
+    Occ3D before full training (config-driven, scripts/train_encoder.py).
+    """
+    C = sem_logit.shape[-1]
+    sem_prob = F.softmax(sem_logit, dim=-1)
+    probs = torch.cat([occ_prob.unsqueeze(-1) * sem_prob,
+                       (1.0 - occ_prob).unsqueeze(-1)], dim=-1)   # [B, V, C+1]
+    logp = torch.log(probs.clamp_min(1e-6))
+
+    gt = gt_label.clone()
+    gt[gt == free_class] = C                    # free -> last channel
+    m = visible.reshape(-1)
+    ce = F.nll_loss(logp.reshape(-1, C + 1)[m], gt.reshape(-1)[m],
+                    weight=class_weights)
+    lov = lovasz_softmax(probs.reshape(-1, C + 1)[m], gt.reshape(-1)[m],
+                         ignore=C)
+    return ce_weight * ce + lovasz_weight * lov
 
 
 def occupancy_recon_loss(occ_prob: torch.Tensor, sem_logit: torch.Tensor,

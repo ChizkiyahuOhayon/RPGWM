@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from rpgwm.models.encoder import GaussianEncoder, safe_inverse_sigmoid
+from rpgwm.models.encoder import GaussianEncoder
 from rpgwm.models.gaussians import quat_to_rotmat
 from rpgwm.models.gf2_warmstart import build_key_map, load_gf2_partial
 
@@ -118,44 +118,43 @@ def test_gradients_reach_the_backbone():
     assert stem_grads and any(g.abs().sum() > 0 for g in stem_grads)
 
 
-def test_gf2_warmstart_mapping_and_anchor_conversion():
+def test_gf2_warmstart_block_mapping():
+    """Fake-checkpoint test: proves ONLY that the mapper is self-consistent
+    (naming + shapes). Real acceptance is the stage-A 1/4-split A/B — the
+    fake 100% here must never be quoted as transfer evidence."""
     enc = make_encoder()
     key_map = build_key_map(enc)
     assert key_map, "no transferable keys found"
+    # denominator sanity: block keys only — no backbone/lifter/head keys
+    assert all(k.startswith("encoder.") for k in key_map)
     ours = enc.state_dict()
 
     g = torch.Generator().manual_seed(7)
     fake = {ck: torch.randn(ours[our].shape, generator=g)
             for ck, our in key_map.items()}
-    # lifter: 16 anchors with xyz at the exact center of the SOURCE range
-    n_lift = 16
-    lift = torch.randn(n_lift, enc.codec.dim, generator=g)
-    lift[:, :3] = safe_inverse_sigmoid(torch.full((n_lift, 3), 0.5))
-    fake["lifter.anchor"] = lift
-    fake["lifter.instance_feature"] = torch.randn(n_lift, 32, generator=g)
-    fake["img_backbone.conv1.weight"] = torch.randn(4, 4)  # must be ignored
+    fake["img_backbone.conv1.weight"] = torch.randn(4, 4)      # ignored
+    fake["lifter.anchor"] = torch.randn(16, 25)                # ignored (no xyz bank)
 
-    report = load_gf2_partial(enc, fake, src_pc_range=(-8, -8, -2, 8, 8, 2),
-                              verbose=False)
-    assert report["coverage"] == 1.0
-    assert report["anchor_slots_warmstarted"] == n_lift
-    assert report["anchor_kept_in_range_frac"] == 1.0  # all at source center
-    assert report["anchor_slots_resampled"] == enc.num_slots - n_lift
-    # filled slots are resampled from the GF-2 empirical distribution:
-    # non-xyz attributes must match some warm-started row exactly
-    filled = enc.anchor.detach()[n_lift:, 3:]
-    diffs = (filled[:, None, :] - lift[None, :, 3:]).abs().amax(-1)
-    assert (diffs.amin(1) < 1e-6).all()
-
+    report = load_gf2_partial(enc, fake, verbose=False)
+    assert report["block_coverage"] == 1.0
+    assert "img_backbone" in " ".join(report["not_transferred"])
     # a mapped weight really got copied
     probe_ck = "encoder.layers.1.output_proj.weight"
     assert torch.allclose(enc.state_dict()["blocks.0.deformable.output_proj.weight"],
                           fake[probe_ck])
-    # center of source range (0,0,0) m must land at (0,0,0) m in our range
-    mu0 = enc.codec.xyz(enc.anchor[None])[0, :n_lift]
-    assert torch.allclose(mu0, torch.zeros_like(mu0), atol=1e-3)
-    # non-xyz attributes copied verbatim
-    assert torch.allclose(enc.anchor[:n_lift, 3:], lift[:, 3:])
+    # anchor bank untouched — it is OUR grid prior now, not a transfer target
+    assert torch.allclose(enc.anchor.detach(),
+                          make_encoder().anchor.detach())
+
+
+def test_semantic_alignment_guard():
+    from rpgwm.models.gf2_warmstart import (GF2_CLASS_NAMES,
+                                            assert_semantic_alignment)
+    assert_semantic_alignment()  # identity today — must pass
+    tampered = list(GF2_CLASS_NAMES)
+    tampered[3], tampered[4] = tampered[4], tampered[3]
+    with pytest.raises(RuntimeError, match="permutation"):
+        assert_semantic_alignment(src=tuple(tampered))
 
 
 def test_gf2_warmstart_rejects_shape_drift():

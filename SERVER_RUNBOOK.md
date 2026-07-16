@@ -80,17 +80,39 @@ cd third_party/GaussianFormer && pip install -r requirements.txt
 CUDA_VISIBLE_DEVICES=0 python eval.py --py-config config/prob/nuscenes_gs6400.py \
     --work-dir out/gf2_repro --resume-from ckpts/gaussianformer2_prob64.pth
 ```
-- **验收（输出级复现，2026-07-16 起取代"覆盖率%"）**：
-  1. 官方设定下 SurroundOcc mIoU 复现 Prob-64 报告值 20.04，差 <0.3；
-  2. 我方热启：`load_gf2_partial` 报告存档（coverage / anchor_kept_in_range_frac /
-     resampled 数），随后**未训练**的我方编码器在我们设定（R50@256×704/Occ3D）下
-     跑推理评测，记录零训练 mIoU 基线值——这是阶段 A 收敛曲线的起点参照，
-     伪 checkpoint 的 100% 只证明映射器自洽，不算证据；
-  3. 图像预处理与官方逐项对齐后才算完成：GF-2 用 ImageNet 均值方差
-     mean=[123.675,116.28,103.53] std=[58.395,57.12,57.375] to_rgb=True
-     （config/_base_/surroundocc.py:8）——我方 dataloader 必须一致（/255 后即
-     torchvision 标准归一化），resize 到 256×704 无 crop，核对写进对拍记录。
-- 产物：权重路径 + 三项验收记录登记进 `configs/paths.yaml`。
+- **本步定位（2026-07-16 重定义）：环境自检,不是热启证据。** 我们的编码器
+  架构 ≠ 官方（R50@256×704 vs R101-DCN@1600×864），复现不出我方数字是正常的。
+  1. **环境自检**：官方仓库原样（官方 config + 官方 localagg_prob CUDA 核）复现
+     Prob-64 的 SurroundOcc mIoU 20.04（README:111），差 <0.3 → 只证明环境与
+     数据没问题；
+  2. **热启报告存档**：`load_gf2_partial` 的 block_coverage（分母只含 Gaussian
+     block；backbone/FPN/lifter 在 NOT_TRANSFERRED 清单里，理由见
+     rpgwm/models/gf2_warmstart.py 头注释）。此数字不是 gate；
+  3. **热启唯一验收 = 阶段 A 的 1/4-split A/B**：`configs/stage_a.yaml` 分别以
+     `warmstart: gf2` / `warmstart: none` 各跑 1–2 epoch，比 report.json 的
+     val miou，谁赢用谁，结果记录在案；
+  4. **类序断言**：用 `data/occ3d/annotations.json` 的 category 列表核对
+     `rpgwm/models/gf2_warmstart.py` 里 OCC3D_CLASS_NAMES（顺序必须逐项一致，
+     不一致改代码里的表并重跑 test_semantic_alignment_guard）。
+- **两个 gate 不许混**：上面 1 是编码器环境自检;我们的可微 splat 对拍官方
+  localagg_prob 核（同一组 Gaussian 输入,占据概率差 <1e-4）是**另一条**
+  独立验收（splat 保真度,服务 Gate-1),完成后各自记录。
+- 产物：权重路径 + 各项验收记录登记进 `configs/paths.yaml`。
+
+## 2.5 阶段 A 训练（W2–3，GPU 0；A-G 在 GPU 1 上继续）
+
+```bash
+# 先冒烟（合成数据已在本地过,这里用真实 mini 索引再冒一次烟）
+python scripts/build_index.py --nuscenes-root data/nuscenes --version v1.0-mini \
+    --split train --out data/index_mini_train.json     # 含 cams 记录
+CUDA_VISIBLE_DEVICES=0 python scripts/train_encoder.py --config configs/stage_a.yaml \
+    --max-steps 50        # 短跑：确认 loss 下降 + report.json 的 budget 块有数
+# report.json -> budget.sec_per_iter_measured / hours_per_epoch_projected /
+# gpu_days_for_cfg_epochs —— 把这三个数报回来,用于重估 §3.2 阶段 A 行
+```
+- A/B 两臂（warmstart gf2/none）在 1/4-split 上排队跑,不抢卡；
+- class_weights 全量训练前按 Occ3D train 频率重算（GF-2 的表是 SurroundOcc 拟合）；
+- **收敛监察**：val-mIoU 曲线 W3 末未走平立即上报,不等 W4 Gate-1。
 
 ## 3. Baseline 复现之二：forecasting 评测协议对拍（≈0.2 GPU-day）
 

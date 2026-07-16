@@ -1,0 +1,72 @@
+# Stage A: perception-encoder adaptation on nuScenes + Occ3D (2xA40).
+# Disciplines (2026-07-16): everything config-driven; encoder stage is
+# no-innovation (official GF-2 loss recipe); warm-start is a lottery decided
+# by the 1/4-split A/B (run once with warmstart: gf2, once with none, compare
+# report.json val miou — whichever wins is used).
+run_name: stage_a
+seed: 0
+
+data:
+  synthetic: false
+  nuscenes_root: data/nuscenes
+  occ3d_root: data/occ3d
+  index_train: data/index_train.json      # build_index.py WITH cams
+  index_val: data/index_val.json
+  history_frames: 4                       # 2 s @ 2 Hz streaming warm-up
+  pipeline:
+    # BEVDet/S2GO-style: scale 704/1600 = 0.44 -> 396x704, crop 140 rows from
+    # the top (sky). NOT a direct resize (would squash aspect by ~35% and
+    # break every ego2img). Normalization = ImageNet (= GF-2's constants
+    # config/_base_/surroundocc.py:8, applied after /255) inside ImagePipeline.
+    raw_hw: [900, 1600]
+    final_hw: [256, 704]
+
+model:
+  num_gaussians: 6400
+  num_classes: 17
+  feat_dim: 256
+  encoder:
+    backbone: resnet50                    # decision B1(a); R101@1600x864 rejected
+    backbone_weights: imagenet            # or nuImages-pretrained R50 (S2GO-Base
+                                          # lineage) if obtainable — preferred
+    embed_dims: 128
+    num_blocks: 4
+    num_cams: 6
+    num_levels: 4                         # FPN strides 8/16/32/64 — OUR design
+    num_groups: 4
+    knn: 16
+    scale_range: [0.01, 3.2]
+    self_interact: knn                    # switch to spconv if RUNBOOK 1.6 passes
+    warmstart: gf2                        # A/B arm 1; arm 2 = none
+    init_from: ckpts/gaussianformer2_prob64.pth
+
+grid:                                     # Occ3D-nuScenes
+  xyz_min: [-40.0, -40.0, -1.0]
+  xyz_max: [40.0, 40.0, 5.4]
+  resolution: [200, 200, 16]
+
+loss:
+  # GF-2 recipe (prob/nuscenes_gs6400.py:40-58): weighted CE x10 + Lovász x1,
+  # lovasz_ignore = free. PixelDistributionLoss N/A (supervises their lifter
+  # initializer, which we do not carry — see rpgwm/losses.py docstring).
+  ce_weight: 10.0
+  lovasz_weight: 1.0
+  # 18 entries, last = free. GF-2's manual_class_weight is SurroundOcc-fitted;
+  # recompute on Occ3D train frequencies before the full run (null = uniform
+  # for the first smoke/A-B runs; record which was used in the report).
+  class_weights: null
+
+train:
+  devices: 2
+  precision: bf16
+  micro_batch_per_gpu: 1
+  grad_accum: 8                           # effective batch 16
+  lr: 2.0e-4
+  weight_decay: 0.01
+  grad_max_norm: 35.0                     # GF-2: grad_max_norm=35 (config:34)
+  epochs: 12
+  history_grad: false                     # detach stream memory (S2GO-style)
+  num_workers: 4
+  log_every: 20
+  eval_batches: 100
+  timing_warmup_iters: 5                  # excluded from iter/s measurement
