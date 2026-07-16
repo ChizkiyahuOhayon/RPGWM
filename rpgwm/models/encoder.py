@@ -354,9 +354,56 @@ class AsymFFN(nn.Module):
         return self.layers(x)
 
 
+class SpconvSlotInteraction(nn.Module):
+    """GF-2's SparseConv3D op, mirrored 1:1 (server path; needs spconv-cuXXX).
+
+    Submodule names (`layer`, `output_proj`) and structure (3x [SubMConv3d k=5
+    + LN + ReLU] + Linear, the prob-config use_multi_layer/use_out_proj
+    variant) match the official module, so the checkpoint transfers with 100%
+    op coverage. The surrounding wiring is residual (official operation order
+    identity->spconv->add->norm, config/prob/nuscenes_gs6400.py:219-222)."""
+
+    IS_GF2_SPCONV = True
+
+    def __init__(self, embed_dims: int, codec: AnchorCodec,
+                 grid_size: float = 1.0, kernel_size: int = 5):
+        super().__init__()
+        import spconv.pytorch as spconv  # server dependency, import-guarded
+        self.codec = codec
+        self.grid_size = grid_size
+        pad = (kernel_size - 1) // 2
+        self.layer = spconv.SparseSequential(
+            spconv.SubMConv3d(embed_dims, embed_dims, kernel_size, 1, pad),
+            nn.LayerNorm(embed_dims), nn.ReLU(True),
+            spconv.SubMConv3d(embed_dims, embed_dims, kernel_size, 1, pad),
+            nn.LayerNorm(embed_dims), nn.ReLU(True),
+            spconv.SubMConv3d(embed_dims, embed_dims, kernel_size, 1, pad),
+            nn.LayerNorm(embed_dims), nn.ReLU(True),
+        )
+        self.output_proj = nn.Linear(embed_dims, embed_dims)
+
+    def forward(self, instance_feature: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+        import spconv.pytorch as spconv
+        B, G = instance_feature.shape[:2]
+        xyz = self.codec.xyz(anchor).flatten(0, 1)
+        lo = xyz.new_tensor(self.codec.pc_range[:3])
+        hi = xyz.new_tensor(self.codec.pc_range[3:])
+        indices = ((xyz - lo) / self.grid_size).to(torch.int32)
+        batch_idx = torch.arange(B, device=xyz.device, dtype=torch.int32) \
+            .view(B, 1, 1).expand(-1, G, -1).flatten(0, 1)
+        spatial = ((hi - lo) / self.grid_size).to(torch.int32)
+        inp = spconv.SparseConvTensor(instance_feature.flatten(0, 1),
+                                      indices=torch.cat([batch_idx, indices], -1),
+                                      spatial_shape=spatial, batch_size=B)
+        out = self.layer(inp).features.unflatten(0, (B, G))
+        return self.output_proj(out)
+
+
 class SlotSelfAttention(nn.Module):
-    """Replaces GF-2's SparseConv3D op (spconv). kNN attention over slot
-    centers; output zero-init so a warm-started block starts undisturbed."""
+    """CPU/fallback substitute for GF-2's SparseConv3D op. kNN attention over
+    slot centers; output zero-init so a warm-started block starts undisturbed
+    (sound because the op sits in a residual branch, see SpconvSlotInteraction
+    docstring)."""
 
     def __init__(self, embed_dims: int, codec: AnchorCodec, knn: int = 16,
                  heads: int = 4):
@@ -400,14 +447,18 @@ class GaussianEncoderBlock(nn.Module):
     """One refinement block, GF-2 operation order."""
 
     def __init__(self, embed_dims: int, codec: AnchorCodec, num_groups: int,
-                 num_levels: int, num_cams: int, knn: int, drop: float = 0.1):
+                 num_levels: int, num_cams: int, knn: int, drop: float = 0.1,
+                 self_interact: str = "knn"):
         super().__init__()
         self.deformable = DeformableImageAggregation(embed_dims, codec, num_groups,
                                                      num_levels, num_cams)
         self.norm1 = nn.LayerNorm(embed_dims)
         self.ffn1 = AsymFFN(embed_dims, drop=drop)
         self.norm2 = nn.LayerNorm(embed_dims)
-        self.self_interact = SlotSelfAttention(embed_dims, codec, knn)
+        if self_interact == "spconv":
+            self.self_interact = SpconvSlotInteraction(embed_dims, codec)
+        else:
+            self.self_interact = SlotSelfAttention(embed_dims, codec, knn)
         self.norm3 = nn.LayerNorm(embed_dims)
         self.ffn2 = AsymFFN(embed_dims, drop=drop)
         self.norm4 = nn.LayerNorm(embed_dims)
@@ -444,7 +495,7 @@ class GaussianEncoder(nn.Module):
                  num_cams: int = 6, num_levels: int = 4, num_groups: int = 4,
                  knn: int = 16, pc_range=(-40.0, -40.0, -1.0, 40.0, 40.0, 5.4),
                  scale_range=(0.01, 3.2), backbone: str = "resnet50",
-                 backbone_weights: str | None = None):
+                 backbone_weights: str | None = None, self_interact: str = "knn"):
         super().__init__()
         self.codec = AnchorCodec(pc_range, scale_range, num_classes)
         self.num_slots = num_slots
@@ -455,7 +506,8 @@ class GaussianEncoder(nn.Module):
         self.anchor_embed = GaussianAnchorEmbed(embed_dims, num_classes)
         self.blocks = nn.ModuleList([
             GaussianEncoderBlock(embed_dims, self.codec, num_groups, num_levels,
-                                 num_cams, knn) for _ in range(num_blocks)])
+                                 num_cams, knn, self_interact=self_interact)
+            for _ in range(num_blocks)])
         self.out_feat = nn.Linear(embed_dims, feat_dim)
 
     # -- streaming rigid transfer ------------------------------------------

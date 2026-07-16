@@ -139,6 +139,13 @@ def test_gf2_warmstart_mapping_and_anchor_conversion():
                               verbose=False)
     assert report["coverage"] == 1.0
     assert report["anchor_slots_warmstarted"] == n_lift
+    assert report["anchor_kept_in_range_frac"] == 1.0  # all at source center
+    assert report["anchor_slots_resampled"] == enc.num_slots - n_lift
+    # filled slots are resampled from the GF-2 empirical distribution:
+    # non-xyz attributes must match some warm-started row exactly
+    filled = enc.anchor.detach()[n_lift:, 3:]
+    diffs = (filled[:, None, :] - lift[None, :, 3:]).abs().amax(-1)
+    assert (diffs.amin(1) < 1e-6).all()
 
     # a mapped weight really got copied
     probe_ck = "encoder.layers.1.output_proj.weight"
