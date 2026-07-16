@@ -12,6 +12,11 @@ Server instructions: `SERVER_RUNBOOK.md` (2×A40, GPU 0/1)
 ## Layout
 ```
 rpgwm/models/gaussians.py     GaussianState — the single shared state (slots = identity)
+rpgwm/models/encoder.py       §2.0 perception encoder: R50+FPN + 4 GF-2-mirrored
+                              refinement blocks over N fixed slots; streaming rigid
+                              warp (in-place re-seeding keeps slot identity)
+rpgwm/models/gf2_warmstart.py partial warm-start from the official GaussianFormer-2
+                              Prob-64 checkpoint (decision B1(a): backbone excluded)
 rpgwm/models/rollout.py       M1: rollout operator W (kNN attn + action cross-attn), Eq. 1
 rpgwm/models/splat.py         differentiable Gaussian→voxel splatting + future-ego transform
 rpgwm/models/reliability.py   M2: realized error e_i, quantile normalizer, ρ head, ECE,

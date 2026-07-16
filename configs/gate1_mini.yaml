@@ -14,9 +14,20 @@ model:
   num_classes: 17
   feat_dim: 256
   encoder:
+    # Decision B1(a), 2026-07-15: R50 @ 256x704 for S2GO/SparseWorld-level
+    # comparability. The official GF-2 Prob-64 checkpoint is R101-DCN @
+    # 1600x864 (SurroundOcc-supervised), so the warm start is PARTIAL:
+    # refinement blocks + anchor embed + lifter anchors transfer
+    # (rpgwm/models/gf2_warmstart.py); the image backbone starts from
+    # ImageNet/FCOS3D-R50 — a WEAK start. Cost accepted: slower convergence
+    # in stage A. Watch the val-mIoU curve from W2 on; if it has not
+    # plateaued by end of W3, escalate immediately (do not wait for Gate-1
+    # at W4).
     backbone: resnet50
+    embed_dims: 128                         # GF-2 parity (warm-start requires it)
     image_size: [256, 704]
-    init_from: ckpts/gaussianformer2.pth   # warm start (SERVER_RUNBOOK step 2)
+    backbone_weights: imagenet              # or ckpts/fcos3d_r50.pth if available
+    init_from: ckpts/gaussianformer2_prob64.pth   # partial warm start (RUNBOOK step 2)
     freeze: true                            # stage B: frozen encoder
   rollout:
     dim: 256
