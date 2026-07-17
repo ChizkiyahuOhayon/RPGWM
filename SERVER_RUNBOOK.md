@@ -11,8 +11,9 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 conda create -n rpgwm python=3.10 -y && conda activate rpgwm
 pip install torch==2.4.0 torchvision --index-url https://download.pytorch.org/whl/cu121
-git clone <本仓库> && cd RPGWM && pip install -r requirements.txt
-python -m pytest tests/ -q        # 验收：26 passed（和本地一致才继续）
+git clone --recurse-submodules git@github.com:ChizkiyahuOhayon/RPGWM.git
+cd RPGWM && pip install -r requirements.txt
+python -m pytest tests/ -q        # 验收：55 passed（和本地一致才继续）
 ```
 
 ## 1. 数据（一次性）
@@ -25,6 +26,9 @@ data/
 ```
 - nuScenes: https://www.nuscenes.org/download （mini ≈ 4GB 先行）
 - Occ3D-nuScenes: https://github.com/Tsinghua-MARS-Lab/Occ3D （百度网盘/GDrive 链接在其 README）
+- **步骤 2（GF-2 环境自检）额外需要**（Occ3D 之外，GF-2 官方 eval 走 SurroundOcc 协议）：
+  - SurroundOcc 占据标注：https://github.com/weiyithu/SurroundOcc （GF README:79）
+  - GF 官方 pkl 索引：https://cloud.tsinghua.edu.cn/d/bb96379a3e46442c8898/ （GF README:81）
 - 验收：`python -c "import numpy as np; d=np.load('data/occ3d/gts/<任一场景>/<任一token>/labels.npz'); print(d['semantics'].shape, d['mask_camera'].shape)"` 输出 `(200,200,16) (200,200,16)`。
 
 ## 1.5 A-G 教师流水线启动（最高优先，W1 第一天就挂上；GPU 1，与其余步骤并行）
@@ -77,6 +81,10 @@ print('spconv path OK')"
 cd third_party/GaussianFormer && pip install -r requirements.txt
 # 按其 docs/installation.md 装 mm-stack + 4 个 CUDA ops（含 GF-2 的 localagg_prob*）
 # ckpt：README 表中 Prob-64（config/prob/nuscenes_gs6400.py 对应权重）
+# 直链（GF README:111）：https://cloud.tsinghua.edu.cn/f/d041974bd900419fb141/?dl=1
+#   -> 存为 ckpts/gaussianformer2_prob64.pth
+# 其 R101 预训练（官方 eval 需要，GF README:122）：
+#   https://github.com/zhiqi-li/storage/releases/download/v1.0/r101_dcn_fcos3d_pretrain.pth
 CUDA_VISIBLE_DEVICES=0 python eval.py --py-config config/prob/nuscenes_gs6400.py \
     --work-dir out/gf2_repro --resume-from ckpts/gaussianformer2_prob64.pth
 ```
